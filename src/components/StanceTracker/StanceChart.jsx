@@ -1,20 +1,48 @@
-import { useRef, useEffect, useState, useCallback } from 'react'
-import { DAYS, STANCE_COLORS } from '../../data/mockData'
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
+import { DAYS, getTopicColor } from '../../data/mockData'
 
-const MARGIN = { top: 24, right: 12, bottom: 40, left: 0 }
-const ENTITY_GAP = 4      // px gap between entity lanes (rendered as dark spacer)
-const DAY_GAP = 3         // px gap between day columns
-const HIGHLIGHT_DAY = 21  // Jan 22 index for demo tooltip
+const MARGIN = { top: 16, right: 16, bottom: 36, left: 0 }
+const TENSION = 0.28   // Catmull-Rom tension for smooth area curves
+const GRID_COLOR = 'rgba(15,15,19,0.55)'
 
+// ─── Smooth area path (Catmull-Rom → cubic Bezier) ─────────────────────────
+function catmullRomSegments(pts, tension) {
+  if (pts.length < 2) return ''
+  const cmds = [`M ${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`]
+  for (let i = 1; i < pts.length; i++) {
+    const p0 = pts[Math.max(0, i - 2)]
+    const p1 = pts[i - 1]
+    const p2 = pts[i]
+    const p3 = pts[Math.min(pts.length - 1, i + 1)]
+    const cp1x = p1[0] + (p2[0] - p0[0]) * tension
+    const cp1y = p1[1] + (p2[1] - p0[1]) * tension
+    const cp2x = p2[0] - (p3[0] - p1[0]) * tension
+    const cp2y = p2[1] - (p3[1] - p1[1]) * tension
+    cmds.push(
+      `C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`
+    )
+  }
+  return cmds.join(' ')
+}
+
+function buildAreaPath(topPts, botPts) {
+  const top = catmullRomSegments(topPts, TENSION)
+  const revBot = [...botPts].reverse()
+  const botCurve = catmullRomSegments(revBot, TENSION)
+  // Join: forward top edge → jump to bottom-right → reverse bottom edge → close
+  const [, ...botInstructions] = botCurve.split(/(?=C )|(?=M )/)
+  const jumpToBotRight = `L ${revBot[0][0].toFixed(1)},${revBot[0][1].toFixed(1)}`
+  return `${top} ${jumpToBotRight} ${botInstructions.join('')} Z`
+}
+
+// ─── Main component ─────────────────────────────────────────────────────────
 export default function StanceChart({
-  data,
-  viewMode,           // 'macro' | 'drilldown'
-  simulateTooltip,    // boolean — show demo tooltip on Jan 22 / Merrell
-  onHoverDay,         // (dayIndex, entityIndex, rect) => void
-  onLeaveChart,       // () => void
-  onClickEntity,      // (entityIndex) => void — only in macro
-  highlightEntityIdx, // index of entity to highlight (hover state)
-  activeTooltip,      // { dayIndex, entityIndex } | null
+  sortedData,          // pre-sorted topics (highest volume first = bottom of stack)
+  simulateTooltip,     // boolean: show demo hover on Jan 22
+  onHoverCell,         // (dayIndex, topicSortedIdx, { clientX, clientY }) => void
+  onLeaveChart,
+  highlightIdx,        // sorted index to highlight (others dimmed)
+  activeTooltip,       // { dayIndex, topicSortedIdx } | null
 }) {
   const containerRef = useRef(null)
   const [dims, setDims] = useState({ width: 800, height: 480 })
@@ -23,101 +51,100 @@ export default function StanceChart({
     if (!containerRef.current) return
     const ro = new ResizeObserver((entries) => {
       const { width, height } = entries[0].contentRect
-      setDims({ width: Math.max(300, width), height: Math.max(200, height) })
+      setDims({ width: Math.max(300, width), height: Math.max(160, height) })
     })
     ro.observe(containerRef.current)
     return () => ro.disconnect()
   }, [])
 
   const { width, height } = dims
-  const chartW = width - MARGIN.left - MARGIN.right
-  const chartH = height - MARGIN.top - MARGIN.bottom
+  const chartW = width  - MARGIN.left - MARGIN.right
+  const chartH = height - MARGIN.top  - MARGIN.bottom
+  const nDays  = DAYS.length
+  const nTopics = sortedData.length
 
-  const nDays = DAYS.length
-  const nEntities = data.length
+  // ── Stacking ──────────────────────────────────────────────────────────────
+  const { cumTops, cumBots, maxDayTotal } = useMemo(() => {
+    const cumBots = sortedData.map(() => new Array(nDays).fill(0))
+    const cumTops = sortedData.map(() => new Array(nDays).fill(0))
+    for (let d = 0; d < nDays; d++) {
+      let running = 0
+      for (let i = 0; i < nTopics; i++) {
+        cumBots[i][d] = running
+        running += sortedData[i].days[d].total
+        cumTops[i][d] = running
+      }
+    }
+    const dayTotals = Array.from({ length: nDays }, (_, d) =>
+      sortedData.reduce((s, t) => s + t.days[d].total, 0)
+    )
+    return { cumTops, cumBots, maxDayTotal: Math.max(...dayTotals) }
+  }, [sortedData, nDays, nTopics])
 
-  // Compute column width
-  const totalGapW = DAY_GAP * (nDays - 1)
-  const colW = (chartW - totalGapW) / nDays
+  // ── Scales ────────────────────────────────────────────────────────────────
+  const dayStep = chartW / nDays
+  const xAt  = (d) => (d + 0.5) * dayStep
+  const yAt  = (v) => chartH - (v / maxDayTotal) * chartH
 
-  // For each day, compute total volume and cumulative offsets per entity
-  const dayTotals = DAYS.map((_, di) =>
-    data.reduce((sum, e) => sum + e.days[di].volume, 0)
+  // ── Hover detection ──────────────────────────────────────────────────────
+  const handleMouseMove = useCallback((e) => {
+    if (!containerRef.current || !onHoverCell) return
+    const svgEl = containerRef.current.querySelector('svg')
+    if (!svgEl) return
+    const rect  = svgEl.getBoundingClientRect()
+    const mx    = e.clientX - rect.left  - MARGIN.left
+    const my    = e.clientY - rect.top   - MARGIN.top
+    const d     = Math.floor(mx / dayStep)
+    if (d < 0 || d >= nDays) { onLeaveChart?.(); return }
+
+    // Scan topics bottom-to-top (highest idx = top of stack visually)
+    for (let i = nTopics - 1; i >= 0; i--) {
+      const yTop = yAt(cumTops[i][d])
+      const yBot = yAt(cumBots[i][d])
+      if (my >= yTop && my <= yBot) {
+        onHoverCell(d, i, { clientX: e.clientX, clientY: e.clientY })
+        return
+      }
+    }
+    onLeaveChart?.()
+  }, [dayStep, nDays, nTopics, cumTops, cumBots, yAt, onHoverCell, onLeaveChart])
+
+  // ── Gradient definitions ──────────────────────────────────────────────────
+  const gradientDefs = useMemo(() => (
+    sortedData.map((topic) => (
+      <linearGradient
+        key={topic.id}
+        id={`g${topic.id}`}
+        gradientUnits="userSpaceOnUse"
+        x1={0} y1={0} x2={chartW} y2={0}
+      >
+        {topic.days.map((day, d) => (
+          <stop
+            key={d}
+            offset={xAt(d) / chartW}
+            stopColor={getTopicColor(topic.baseHue, day.support, day.neutral, day.oppose, day.total)}
+          />
+        ))}
+      </linearGradient>
+    ))
+  ), [sortedData, chartW, xAt])
+
+  // ── X-axis labels ─────────────────────────────────────────────────────────
+  const xLabels = DAYS.reduce((acc, label, d) => {
+    if (d % 5 === 0 || d === nDays - 1) acc.push({ d, label })
+    return acc
+  }, [])
+
+  // Demo tooltip targets Jan 22 (index 21), Merrell (topic with name 'Merrell')
+  const DEMO_DAY     = 21
+  const DEMO_TOPIC_I = useMemo(
+    () => sortedData.findIndex((t) => t.name === 'Merrell'),
+    [sortedData]
   )
 
-  // Build rects: [entityIndex][dayIndex] = { x, y, w, h, stance, volume }
-  // Within each day column: entities stacked top-to-bottom in fixed order,
-  // proportionally sized, with ENTITY_GAP px spacers between them.
-  const rects = []
-
-  for (let di = 0; di < nDays; di++) {
-    const x = di * (colW + DAY_GAP)
-    const dayTotal = dayTotals[di]
-    // Total usable height after entity gaps
-    const usableH = chartH - ENTITY_GAP * (nEntities - 1)
-    let yOffset = 0
-
-    for (let ei = 0; ei < nEntities; ei++) {
-      const { volume, stance } = data[ei].days[di]
-      const segH = Math.max(1, (volume / dayTotal) * usableH)
-
-      if (!rects[ei]) rects[ei] = []
-      rects[ei][di] = { x, y: yOffset, w: colW, h: segH, stance, volume }
-
-      yOffset += segH + ENTITY_GAP
-    }
-  }
-
-  // Mouse event handlers
-  const handleMouseMove = useCallback((e) => {
-    if (!containerRef.current || !onHoverDay) return
-    const svgEl = containerRef.current.querySelector('svg')
-    if (!svgEl) return
-    const svgRect = svgEl.getBoundingClientRect()
-    const mx = e.clientX - svgRect.left - MARGIN.left
-    const my = e.clientY - svgRect.top - MARGIN.top
-
-    // Find which day column
-    const di = Math.floor(mx / (colW + DAY_GAP))
-    if (di < 0 || di >= nDays) { onLeaveChart && onLeaveChart(); return }
-
-    // Find which entity row
-    for (let ei = 0; ei < nEntities; ei++) {
-      const r = rects[ei][di]
-      if (!r) continue
-      if (my >= r.y && my <= r.y + r.h) {
-        onHoverDay(di, ei, { x: e.clientX, y: e.clientY })
-        return
-      }
-    }
-    onLeaveChart && onLeaveChart()
-  }, [rects, colW, nDays, nEntities, onHoverDay, onLeaveChart])
-
-  const handleClick = useCallback((e) => {
-    if (!containerRef.current || !onClickEntity) return
-    const svgEl = containerRef.current.querySelector('svg')
-    if (!svgEl) return
-    const svgRect = svgEl.getBoundingClientRect()
-    const mx = e.clientX - svgRect.left - MARGIN.left
-    const my = e.clientY - svgRect.top - MARGIN.top
-    const di = Math.floor(mx / (colW + DAY_GAP))
-    if (di < 0 || di >= nDays) return
-    for (let ei = 0; ei < nEntities; ei++) {
-      const r = rects[ei][di]
-      if (!r) continue
-      if (my >= r.y && my <= r.y + r.h) {
-        onClickEntity(ei)
-        return
-      }
-    }
-  }, [rects, colW, nDays, nEntities, onClickEntity])
-
-  // X-axis labels — show every 5 days
-  const xLabels = DAYS.map((label, di) => {
-    if (di % 5 !== 0 && di !== nDays - 1) return null
-    const x = di * (colW + DAY_GAP) + colW / 2
-    return { x, label }
-  }).filter(Boolean)
+  const hoverDay = simulateTooltip
+    ? DEMO_DAY
+    : activeTooltip?.dayIndex ?? null
 
   return (
     <div
@@ -125,114 +152,83 @@ export default function StanceChart({
       style={{ width: '100%', height: '100%', position: 'relative' }}
       onMouseMove={handleMouseMove}
       onMouseLeave={onLeaveChart}
-      onClick={handleClick}
     >
-      <svg
-        width={width}
-        height={height}
-        style={{ display: 'block', cursor: onClickEntity ? 'pointer' : 'default' }}
-      >
-        <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
-          {/* Background */}
-          <rect x={0} y={0} width={chartW} height={chartH} fill="#0f0f13" rx={4} />
+      <svg width={width} height={height} style={{ display: 'block', cursor: 'crosshair' }}>
+        <defs>{gradientDefs}</defs>
 
-          {/* Day column backgrounds — subtle alternation */}
-          {DAYS.map((_, di) => {
-            const x = di * (colW + DAY_GAP)
-            const isHighlighted = simulateTooltip && di === HIGHLIGHT_DAY
+        <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
+          {/* Chart background */}
+          <rect x={0} y={0} width={chartW} height={chartH} fill="#0f0f13" rx={2} />
+
+          {/* Area paths — rendered bottom to top */}
+          {sortedData.map((topic, i) => {
+            const topPts = DAYS.map((_, d) => [xAt(d), yAt(cumTops[i][d])])
+            const botPts = DAYS.map((_, d) => [xAt(d), yAt(cumBots[i][d])])
+            const pathD  = buildAreaPath(topPts, botPts)
+            const isHighlighted = highlightIdx === null || highlightIdx === undefined || highlightIdx === i
+            const opacity = isHighlighted ? 1 : 0.2
             return (
-              <rect
-                key={`bg-${di}`}
-                x={x}
-                y={0}
-                width={colW}
-                height={chartH}
-                fill={isHighlighted ? 'rgba(61,130,196,0.08)' : 'transparent'}
+              <path
+                key={topic.id}
+                d={pathD}
+                fill={`url(#g${topic.id})`}
+                opacity={opacity}
+                style={{ transition: 'opacity 0.15s' }}
               />
             )
           })}
 
-          {/* Entity segments */}
-          {rects.map((entityRects, ei) =>
-            entityRects.map((r, di) => {
-              if (!r) return null
-              const isActiveTooltipDay = activeTooltip &&
-                activeTooltip.dayIndex === di &&
-                activeTooltip.entityIndex === ei
-              const isDemoHighlight = simulateTooltip &&
-                di === HIGHLIGHT_DAY &&
-                ei === 0
+          {/* Day grid lines */}
+          {DAYS.map((_, d) => (
+            <line
+              key={d}
+              x1={xAt(d)} y1={0}
+              x2={xAt(d)} y2={chartH}
+              stroke={GRID_COLOR}
+              strokeWidth={d % 5 === 0 ? 1.5 : 0.75}
+            />
+          ))}
 
-              let opacity = 1
-              if (
-                highlightEntityIdx !== null &&
-                highlightEntityIdx !== undefined &&
-                highlightEntityIdx !== ei
-              ) {
-                opacity = 0.35
-              }
-
-              return (
-                <rect
-                  key={`${ei}-${di}`}
-                  x={r.x}
-                  y={r.y}
-                  width={r.w}
-                  height={r.h}
-                  fill={STANCE_COLORS[r.stance]}
-                  opacity={opacity}
-                  stroke={isDemoHighlight || isActiveTooltipDay ? '#fff' : 'none'}
-                  strokeWidth={isDemoHighlight || isActiveTooltipDay ? 1 : 0}
-                  rx={1}
-                />
-              )
-            })
+          {/* Hovered / demo day column highlight */}
+          {hoverDay !== null && (
+            <rect
+              x={hoverDay * dayStep}
+              y={0}
+              width={dayStep}
+              height={chartH}
+              fill="rgba(255,255,255,0.06)"
+              stroke="rgba(255,255,255,0.18)"
+              strokeWidth={1}
+              pointerEvents="none"
+            />
           )}
 
-          {/* Horizontal entity separators — dark lines across full width */}
-          {Array.from({ length: nEntities - 1 }, (_, ei) => {
-            // y position = bottom of entity ei on day 0 + gap/2
-            const r = rects[ei] && rects[ei][0]
-            if (!r) return null
-            const y = r.y + r.h + ENTITY_GAP / 2
-            return (
-              <line
-                key={`sep-${ei}`}
-                x1={0}
-                y1={y}
-                x2={chartW}
-                y2={y}
-                stroke="#0f0f13"
-                strokeWidth={ENTITY_GAP}
-              />
-            )
-          })}
-
-          {/* Vertical day gap lines */}
-          {DAYS.map((_, di) => {
-            if (di === 0) return null
-            const x = di * (colW + DAY_GAP) - DAY_GAP
+          {/* Hover crosshair on active topic band */}
+          {activeTooltip && (() => {
+            const { dayIndex: d, topicSortedIdx: i } = activeTooltip
+            if (i == null || i < 0) return null
+            const yTop = yAt(cumTops[i][d])
+            const yBot = yAt(cumBots[i][d])
             return (
               <rect
-                key={`vgap-${di}`}
-                x={x}
-                y={0}
-                width={DAY_GAP}
-                height={chartH}
-                fill="#0f0f13"
+                x={d * dayStep + 1} y={yTop}
+                width={dayStep - 2} height={Math.max(1, yBot - yTop)}
+                fill="rgba(255,255,255,0.15)"
+                rx={1}
+                pointerEvents="none"
               />
             )
-          })}
+          })()}
 
-          {/* X-axis baseline */}
+          {/* Baseline */}
           <line x1={0} y1={chartH} x2={chartW} y2={chartH} stroke="#2d2d3d" strokeWidth={1} />
 
           {/* X-axis labels */}
-          {xLabels.map(({ x, label }) => (
+          {xLabels.map(({ d, label }) => (
             <text
               key={label}
-              x={x}
-              y={chartH + 16}
+              x={xAt(d)}
+              y={chartH + 18}
               textAnchor="middle"
               fill="#505068"
               fontSize={10}
@@ -242,34 +238,6 @@ export default function StanceChart({
               {label}
             </text>
           ))}
-
-          {/* Hover day highlight line */}
-          {activeTooltip && (() => {
-            const x = activeTooltip.dayIndex * (colW + DAY_GAP) + colW / 2
-            return (
-              <line
-                x1={x} y1={0} x2={x} y2={chartH}
-                stroke="rgba(255,255,255,0.15)"
-                strokeWidth={1}
-                strokeDasharray="3,3"
-              />
-            )
-          })()}
-
-          {/* Demo tooltip day marker */}
-          {simulateTooltip && (() => {
-            const x = HIGHLIGHT_DAY * (colW + DAY_GAP) + colW / 2
-            return (
-              <>
-                <line
-                  x1={x} y1={0} x2={x} y2={chartH}
-                  stroke="rgba(255,255,255,0.2)"
-                  strokeWidth={1}
-                  strokeDasharray="3,3"
-                />
-              </>
-            )
-          })()}
         </g>
       </svg>
     </div>
