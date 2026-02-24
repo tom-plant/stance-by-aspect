@@ -1,72 +1,48 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
-import { DAYS, getTopicColor } from '../../data/mockData'
+import { DAYS, getStanceColor } from '../../data/mockData'
 
-const MARGIN = { top: 16, right: 16, bottom: 36, left: 0 }
-const TENSION = 0.28   // Catmull-Rom tension for smooth area curves
-const GRID_COLOR = 'rgba(15,15,19,0.55)'
+// Chart margins — left reserved for entity name labels
+const L_MAR = 128
+const R_MAR = 12
+const T_MAR = 16
+const B_MAR = 38
 
-// ─── Smooth area path (Catmull-Rom → cubic Bezier) ─────────────────────────
-function catmullRomSegments(pts, tension) {
-  if (pts.length < 2) return ''
-  const cmds = [`M ${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`]
-  for (let i = 1; i < pts.length; i++) {
-    const p0 = pts[Math.max(0, i - 2)]
-    const p1 = pts[i - 1]
-    const p2 = pts[i]
-    const p3 = pts[Math.min(pts.length - 1, i + 1)]
-    const cp1x = p1[0] + (p2[0] - p0[0]) * tension
-    const cp1y = p1[1] + (p2[1] - p0[1]) * tension
-    const cp2x = p2[0] - (p3[0] - p1[0]) * tension
-    const cp2y = p2[1] - (p3[1] - p1[1]) * tension
-    cmds.push(
-      `C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`
-    )
-  }
-  return cmds.join(' ')
-}
+const DAY_GAP = 2     // px gap between consecutive day columns
+const ENT_GAP = 2     // px gap between entity segments (creates lane separation)
+const MIN_LABEL_H = 5 // minimum avg px height before we hide an entity label
 
-function buildAreaPath(topPts, botPts) {
-  const top = catmullRomSegments(topPts, TENSION)
-  const revBot = [...botPts].reverse()
-  const botCurve = catmullRomSegments(revBot, TENSION)
-  // Join: forward top edge → jump to bottom-right → reverse bottom edge → close
-  const [, ...botInstructions] = botCurve.split(/(?=C )|(?=M )/)
-  const jumpToBotRight = `L ${revBot[0][0].toFixed(1)},${revBot[0][1].toFixed(1)}`
-  return `${top} ${jumpToBotRight} ${botInstructions.join('')} Z`
-}
-
-// ─── Main component ─────────────────────────────────────────────────────────
 export default function StanceChart({
-  sortedData,          // pre-sorted topics (highest volume first = bottom of stack)
-  simulateTooltip,     // boolean: show demo hover on Jan 22
-  onHoverCell,         // (dayIndex, topicSortedIdx, { clientX, clientY }) => void
+  sortedData,
+  simulateTooltip,
+  onHoverCell,
   onLeaveChart,
-  highlightIdx,        // sorted index to highlight (others dimmed)
-  activeTooltip,       // { dayIndex, topicSortedIdx } | null
+  highlightIdx,
+  activeTooltip,
 }) {
   const containerRef = useRef(null)
-  const [dims, setDims] = useState({ width: 800, height: 480 })
+  const [dims, setDims] = useState({ width: 900, height: 480 })
 
   useEffect(() => {
     if (!containerRef.current) return
-    const ro = new ResizeObserver((entries) => {
-      const { width, height } = entries[0].contentRect
-      setDims({ width: Math.max(300, width), height: Math.max(160, height) })
+    const ro = new ResizeObserver(([e]) => {
+      const { width, height } = e.contentRect
+      setDims({ width: Math.max(400, width), height: Math.max(200, height) })
     })
     ro.observe(containerRef.current)
     return () => ro.disconnect()
   }, [])
 
   const { width, height } = dims
-  const chartW = width  - MARGIN.left - MARGIN.right
-  const chartH = height - MARGIN.top  - MARGIN.bottom
-  const nDays  = DAYS.length
+  const chartW  = width  - L_MAR - R_MAR
+  const chartH  = height - T_MAR - B_MAR
+  const nDays   = DAYS.length
   const nTopics = sortedData.length
 
-  // ── Stacking ──────────────────────────────────────────────────────────────
+  // ── Stacking (cumulative volumes per entity per day) ─────────────────────
   const { cumTops, cumBots, maxDayTotal } = useMemo(() => {
-    const cumBots = sortedData.map(() => new Array(nDays).fill(0))
-    const cumTops = sortedData.map(() => new Array(nDays).fill(0))
+    const cumBots = sortedData.map(() => new Float32Array(nDays))
+    const cumTops = sortedData.map(() => new Float32Array(nDays))
+    let max = 0
     for (let d = 0; d < nDays; d++) {
       let running = 0
       for (let i = 0; i < nTopics; i++) {
@@ -74,77 +50,70 @@ export default function StanceChart({
         running += sortedData[i].days[d].total
         cumTops[i][d] = running
       }
+      if (running > max) max = running
     }
-    const dayTotals = Array.from({ length: nDays }, (_, d) =>
-      sortedData.reduce((s, t) => s + t.days[d].total, 0)
-    )
-    return { cumTops, cumBots, maxDayTotal: Math.max(...dayTotals) }
+    return { cumTops, cumBots, maxDayTotal: max || 1 }
   }, [sortedData, nDays, nTopics])
 
   // ── Scales ────────────────────────────────────────────────────────────────
-  const dayStep = chartW / nDays
-  const xAt  = (d) => (d + 0.5) * dayStep
+  const dayW = (chartW - DAY_GAP * (nDays - 1)) / nDays
+  const xAt  = (d) => d * (dayW + DAY_GAP)
   const yAt  = (v) => chartH - (v / maxDayTotal) * chartH
+
+  // ── Entity label Y positions (average midpoint of each band) ─────────────
+  const labelMeta = sortedData.map((topic, i) => {
+    let sumY = 0, sumH = 0
+    for (let d = 0; d < nDays; d++) {
+      const yTop = yAt(cumTops[i][d])
+      const yBot = yAt(cumBots[i][d])
+      sumY += (yTop + yBot) / 2
+      sumH += (yBot - yTop)
+    }
+    return {
+      y:    sumY / nDays,
+      avgH: sumH / nDays,
+      name: topic.name,
+    }
+  })
 
   // ── Hover detection ──────────────────────────────────────────────────────
   const handleMouseMove = useCallback((e) => {
     if (!containerRef.current || !onHoverCell) return
     const svgEl = containerRef.current.querySelector('svg')
     if (!svgEl) return
-    const rect  = svgEl.getBoundingClientRect()
-    const mx    = e.clientX - rect.left  - MARGIN.left
-    const my    = e.clientY - rect.top   - MARGIN.top
-    const d     = Math.floor(mx / dayStep)
+    const rect = svgEl.getBoundingClientRect()
+    const mx   = e.clientX - rect.left - L_MAR
+    const my   = e.clientY - rect.top  - T_MAR
+
+    const d = Math.floor(mx / (dayW + DAY_GAP))
     if (d < 0 || d >= nDays) { onLeaveChart?.(); return }
 
-    // Scan topics bottom-to-top (highest idx = top of stack visually)
+    // Scan from top of stack downward
     for (let i = nTopics - 1; i >= 0; i--) {
-      const yTop = yAt(cumTops[i][d])
-      const yBot = yAt(cumBots[i][d])
-      if (my >= yTop && my <= yBot) {
+      if (my >= yAt(cumTops[i][d]) && my <= yAt(cumBots[i][d])) {
         onHoverCell(d, i, { clientX: e.clientX, clientY: e.clientY })
         return
       }
     }
     onLeaveChart?.()
-  }, [dayStep, nDays, nTopics, cumTops, cumBots, yAt, onHoverCell, onLeaveChart])
+  }, [dayW, nDays, nTopics, cumTops, cumBots, yAt, onHoverCell, onLeaveChart])
 
-  // ── Gradient definitions ──────────────────────────────────────────────────
-  const gradientDefs = useMemo(() => (
-    sortedData.map((topic) => (
-      <linearGradient
-        key={topic.id}
-        id={`g${topic.id}`}
-        gradientUnits="userSpaceOnUse"
-        x1={0} y1={0} x2={chartW} y2={0}
-      >
-        {topic.days.map((day, d) => (
-          <stop
-            key={d}
-            offset={xAt(d) / chartW}
-            stopColor={getTopicColor(topic.baseHue, day.support, day.neutral, day.oppose, day.total)}
-          />
-        ))}
-      </linearGradient>
-    ))
-  ), [sortedData, chartW, xAt])
-
-  // ── X-axis labels ─────────────────────────────────────────────────────────
-  const xLabels = DAYS.reduce((acc, label, d) => {
-    if (d % 5 === 0 || d === nDays - 1) acc.push({ d, label })
-    return acc
-  }, [])
-
-  // Demo tooltip targets Jan 22 (index 21), Merrell (topic with name 'Merrell')
-  const DEMO_DAY     = 21
-  const DEMO_TOPIC_I = useMemo(
-    () => sortedData.findIndex((t) => t.name === 'Merrell'),
+  // Demo targets Jan 22 (day 21), Merrell entity
+  const DEMO_DAY = 21
+  const demoTopicI = useMemo(
+    () => sortedData.findIndex(t => t.name === 'Merrell'),
     [sortedData]
   )
 
   const hoverDay = simulateTooltip
     ? DEMO_DAY
-    : activeTooltip?.dayIndex ?? null
+    : (activeTooltip?.dayIndex ?? null)
+
+  // X-axis labels every 5 days
+  const xLabels = DAYS.reduce((acc, lbl, d) => {
+    if (d % 5 === 0 || d === nDays - 1) acc.push({ d, lbl })
+    return acc
+  }, [])
 
   return (
     <div
@@ -154,91 +123,143 @@ export default function StanceChart({
       onMouseLeave={onLeaveChart}
     >
       <svg width={width} height={height} style={{ display: 'block', cursor: 'crosshair' }}>
-        <defs>{gradientDefs}</defs>
 
-        <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
-          {/* Chart background */}
-          <rect x={0} y={0} width={chartW} height={chartH} fill="#0f0f13" rx={2} />
+        {/* ── Chart area ─────────────────────────────────────────────────── */}
+        <g transform={`translate(${L_MAR},${T_MAR})`}>
 
-          {/* Area paths — rendered bottom to top */}
+          {/* Background */}
+          <rect x={0} y={0} width={chartW} height={chartH} fill="#0f0f13" />
+
+          {/* Subtle day column backgrounds — every other day faintly highlighted */}
+          {DAYS.map((_, d) => d % 2 === 0 ? (
+            <rect key={d} x={xAt(d)} y={0} width={dayW} height={chartH}
+              fill="rgba(255,255,255,0.012)" />
+          ) : null)}
+
+          {/* Entity segments — rendered bottom to top */}
           {sortedData.map((topic, i) => {
-            const topPts = DAYS.map((_, d) => [xAt(d), yAt(cumTops[i][d])])
-            const botPts = DAYS.map((_, d) => [xAt(d), yAt(cumBots[i][d])])
-            const pathD  = buildAreaPath(topPts, botPts)
-            const isHighlighted = highlightIdx === null || highlightIdx === undefined || highlightIdx === i
-            const opacity = isHighlighted ? 1 : 0.2
-            return (
-              <path
-                key={topic.id}
-                d={pathD}
-                fill={`url(#g${topic.id})`}
-                opacity={opacity}
-                style={{ transition: 'opacity 0.15s' }}
-              />
-            )
+            const dimmed  = highlightIdx != null && highlightIdx !== i
+            const opacity = dimmed ? 0.22 : 1
+            return DAYS.map((_, d) => {
+              const yTop = yAt(cumTops[i][d])
+              const yBot = yAt(cumBots[i][d])
+              const segH = yBot - yTop - ENT_GAP
+              if (segH < 0.5) return null
+              const day   = topic.days[d]
+              const color = getStanceColor(day.support, day.neutral, day.oppose, day.total)
+              return (
+                <rect
+                  key={`${i}-${d}`}
+                  x={xAt(d)}
+                  y={yTop}
+                  width={dayW}
+                  height={segH}
+                  fill={color}
+                  opacity={opacity}
+                  style={{ transition: 'opacity 0.12s' }}
+                />
+              )
+            })
           })}
 
-          {/* Day grid lines */}
-          {DAYS.map((_, d) => (
-            <line
-              key={d}
-              x1={xAt(d)} y1={0}
-              x2={xAt(d)} y2={chartH}
-              stroke={GRID_COLOR}
-              strokeWidth={d % 5 === 0 ? 1.5 : 0.75}
-            />
-          ))}
-
-          {/* Hovered / demo day column highlight */}
+          {/* Hovered day column highlight */}
           {hoverDay !== null && (
             <rect
-              x={hoverDay * dayStep}
-              y={0}
-              width={dayStep}
-              height={chartH}
-              fill="rgba(255,255,255,0.06)"
-              stroke="rgba(255,255,255,0.18)"
+              x={xAt(hoverDay)} y={0} width={dayW} height={chartH}
+              fill="rgba(255,255,255,0.07)"
+              stroke="rgba(255,255,255,0.22)"
               strokeWidth={1}
               pointerEvents="none"
             />
           )}
 
-          {/* Hover crosshair on active topic band */}
+          {/* Active cell highlight (live hover or demo) */}
           {activeTooltip && (() => {
             const { dayIndex: d, topicSortedIdx: i } = activeTooltip
             if (i == null || i < 0) return null
             const yTop = yAt(cumTops[i][d])
             const yBot = yAt(cumBots[i][d])
+            const h    = Math.max(1, yBot - yTop - ENT_GAP)
             return (
               <rect
-                x={d * dayStep + 1} y={yTop}
-                width={dayStep - 2} height={Math.max(1, yBot - yTop)}
-                fill="rgba(255,255,255,0.15)"
+                x={xAt(d)} y={yTop} width={dayW} height={h}
+                fill="none"
+                stroke="rgba(255,255,255,0.55)"
+                strokeWidth={1.5}
                 rx={1}
                 pointerEvents="none"
               />
             )
           })()}
 
-          {/* Baseline */}
-          <line x1={0} y1={chartH} x2={chartW} y2={chartH} stroke="#2d2d3d" strokeWidth={1} />
+          {/* X-axis baseline */}
+          <line x1={0} y1={chartH} x2={chartW} y2={chartH}
+            stroke="#2d2d3d" strokeWidth={1} />
 
-          {/* X-axis labels */}
-          {xLabels.map(({ d, label }) => (
+          {/* X-axis day labels */}
+          {xLabels.map(({ d, lbl }) => (
             <text
-              key={label}
-              x={xAt(d)}
-              y={chartH + 18}
+              key={lbl}
+              x={xAt(d) + dayW / 2}
+              y={chartH + 17}
               textAnchor="middle"
               fill="#505068"
               fontSize={10}
               fontFamily="Inter, sans-serif"
-              fontWeight="500"
             >
-              {label}
+              {lbl}
             </text>
           ))}
+
         </g>
+
+        {/* ── Entity labels (left margin) ────────────────────────────────── */}
+        <g transform={`translate(0,${T_MAR})`}>
+          {labelMeta.map((lm, i) => {
+            if (lm.avgH < MIN_LABEL_H) return null
+            const isActive = highlightIdx === i
+            const isDemoFocus = simulateTooltip && i === demoTopicI
+            return (
+              <text
+                key={sortedData[i].id}
+                x={L_MAR - 8}
+                y={lm.y + 3.5}
+                textAnchor="end"
+                fill={isActive || isDemoFocus ? '#c8c8e0' : '#3e3e58'}
+                fontSize={9.5}
+                fontFamily="Inter, sans-serif"
+                fontWeight={isActive || isDemoFocus ? '600' : '400'}
+                style={{ transition: 'fill 0.12s' }}
+              >
+                {lm.name}
+              </text>
+            )
+          })}
+
+          {/* Separator reference lines — drawn at average entity boundaries */}
+          {labelMeta.map((lm, i) => {
+            if (i === 0 || lm.avgH < MIN_LABEL_H) return null
+            // Average top of this entity's band
+            let sumTop = 0
+            for (let d = 0; d < nDays; d++) {
+              sumTop += yAt(cumTops[i][d])
+            }
+            const avgTop = sumTop / nDays
+            return (
+              <line
+                key={`sep-${i}`}
+                x1={L_MAR}
+                y1={avgTop}
+                x2={L_MAR + chartW}
+                y2={avgTop}
+                stroke="rgba(255,255,255,0.04)"
+                strokeWidth={1}
+                strokeDasharray="2,4"
+              />
+            )
+          })}
+        </g>
+
       </svg>
     </div>
   )

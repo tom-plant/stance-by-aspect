@@ -1,26 +1,17 @@
-import { getTopicColor } from '../../data/mockData'
+import { getStanceColor } from '../../data/mockData'
 
-// Show a small swatch of a topic at mid-stance (neutral reference)
-function topicSwatch(baseHue) {
-  return getTopicColor(baseHue, 0.35, 0.3, 0.35, 1) // lean≈0, mid-conf
-}
-
-// Build a mini encoding demo strip for one hue
-function encodingStops(baseHue) {
-  return [
-    { label: 'Support',  color: getTopicColor(baseHue,  0.8, 0.1, 0.1, 1) },
-    { label: 'Lean',     color: getTopicColor(baseHue,  0.5, 0.2, 0.3, 1) },
-    { label: 'Mixed',    color: getTopicColor(baseHue,  0.3, 0.6, 0.1, 1) },
-    { label: 'Lean',     color: getTopicColor(baseHue,  0.1, 0.2, 0.7, 1) },
-    { label: 'Oppose',   color: getTopicColor(baseHue,  0.0, 0.1, 0.9, 1) },
-  ]
-}
-
-const DEMO_HUE = 210
+// Build gradient stops for the red-gray-blue scale preview
+const SCALE_STOPS = [
+  { pos: '0%',   s: 0,  n: 0.1, o: 0.9, t: 1 },  // strong oppose
+  { pos: '30%',  s: 0.2, n: 0.3, o: 0.5, t: 1 }, // lean oppose
+  { pos: '50%',  s: 0.3, n: 0.6, o: 0.1, t: 1 }, // neutral
+  { pos: '70%',  s: 0.5, n: 0.3, o: 0.2, t: 1 }, // lean support
+  { pos: '100%', s: 0.9, n: 0.1, o: 0, t: 1 },   // strong support
+]
 
 const s = {
   panel: {
-    width: '210px',
+    width: '200px',
     flexShrink: 0,
     display: 'flex',
     flexDirection: 'column',
@@ -41,45 +32,45 @@ const s = {
     textTransform: 'uppercase',
     marginBottom: '10px',
   },
-  encRow: {
-    display: 'flex',
-    gap: '2px',
-    height: '20px',
-    borderRadius: '4px',
+  gradBar: {
+    height: '10px',
+    borderRadius: '5px',
+    marginBottom: '6px',
     overflow: 'hidden',
-    marginBottom: '8px',
   },
-  encCell: (color) => ({
-    flex: 1,
-    backgroundColor: color,
+  gradInner: (stops) => ({
+    height: '100%',
+    background: `linear-gradient(to right, ${stops.map(st =>
+      `${getStanceColor(st.s, st.n, st.o, st.t)} ${st.pos}`
+    ).join(', ')})`,
   }),
-  encLabels: {
+  gradLabels: {
     display: 'flex',
     justifyContent: 'space-between',
     fontSize: '9px',
-    color: '#404058',
+    color: '#404060',
     fontWeight: '500',
-    marginBottom: '10px',
+    marginBottom: '12px',
   },
-  hint: {
-    fontSize: '10px',
-    color: '#404058',
-    lineHeight: '1.5',
-    marginTop: '4px',
-  },
-  hintLine: {
+  hintRow: {
     display: 'flex',
-    alignItems: 'center',
-    gap: '5px',
-    marginBottom: '3px',
+    alignItems: 'flex-start',
+    gap: '7px',
+    marginBottom: '5px',
   },
-  hintDot: (color) => ({
-    width: '8px',
-    height: '8px',
+  hintSwatch: (s, n, o) => ({
+    width: '10px',
+    height: '10px',
     borderRadius: '2px',
     flexShrink: 0,
-    backgroundColor: color,
+    marginTop: '1px',
+    backgroundColor: getStanceColor(s, n, o, 1),
   }),
+  hintText: {
+    fontSize: '10px',
+    color: '#404060',
+    lineHeight: '1.4',
+  },
   scrollList: {
     flex: 1,
     overflowY: 'auto',
@@ -91,73 +82,82 @@ const s = {
     gap: '8px',
     padding: '6px 16px',
     cursor: 'pointer',
-    backgroundColor: active ? 'rgba(255,255,255,0.05)' : 'transparent',
-    borderLeft: active ? '2px solid rgba(255,255,255,0.3)' : '2px solid transparent',
+    backgroundColor: active ? 'rgba(255,255,255,0.04)' : 'transparent',
+    borderLeft: active ? '2px solid rgba(255,255,255,0.25)' : '2px solid transparent',
     transition: 'background-color 0.12s',
   }),
-  swatch: (color) => ({
-    width: '10px',
-    height: '10px',
-    borderRadius: '2px',
-    backgroundColor: color,
+  rankNum: {
+    fontSize: '9px',
+    color: '#303048',
+    fontVariantNumeric: 'tabular-nums',
+    width: '14px',
     flexShrink: 0,
-  }),
+    textAlign: 'right',
+  },
   topicName: (active) => ({
     flex: 1,
     fontSize: '11px',
     fontWeight: active ? '600' : '400',
-    color: active ? '#d0d0e8' : '#7070a0',
+    color: active ? '#d0d0e8' : '#6060a0',
     whiteSpace: 'nowrap',
     overflow: 'hidden',
     textOverflow: 'ellipsis',
   }),
   vol: {
     fontSize: '10px',
-    color: '#404058',
+    color: '#363656',
     fontVariantNumeric: 'tabular-nums',
     flexShrink: 0,
   },
 }
 
-const stops = encodingStops(DEMO_HUE)
-
 export default function LegendPanel({ sortedData, activeIdx, onHoverTopic, isDrilldown }) {
   return (
     <div style={s.panel}>
-      {/* Encoding guide */}
+      {/* Color encoding guide */}
       <div style={s.section}>
-        <div style={s.sectionLabel}>Color Encoding</div>
+        <div style={s.sectionLabel}>Color Scale</div>
 
-        <div style={s.encRow}>
-          {stops.map((st, i) => (
-            <div key={i} style={s.encCell(st.color)} />
-          ))}
+        <div style={s.gradBar}>
+          <div style={s.gradInner(SCALE_STOPS)} />
         </div>
-        <div style={s.encLabels}>
-          <span>Support</span>
-          <span>Mixed</span>
+        <div style={s.gradLabels}>
           <span>Oppose</span>
+          <span>Neutral</span>
+          <span>Support</span>
         </div>
 
         <div>
-          <div style={s.hintLine}>
-            <div style={s.hintDot('#6890d0')} />
-            <span style={s.hint}>Lighter = more supportive</span>
+          <div style={s.hintRow}>
+            <div style={s.hintSwatch(0.85, 0.1, 0.05)} />
+            <span style={s.hintText}>Blue = supportive audience</span>
           </div>
-          <div style={s.hintLine}>
-            <div style={s.hintDot('#2a3050')} />
-            <span style={s.hint}>Darker = more opposed</span>
+          <div style={s.hintRow}>
+            <div style={s.hintSwatch(0.1, 0.8, 0.1)} />
+            <span style={s.hintText}>Gray = mixed / neutral signal</span>
           </div>
-          <div style={s.hintLine}>
-            <div style={s.hintDot('#4a4a58')} />
-            <span style={s.hint}>Washed out = mixed / neutral</span>
+          <div style={s.hintRow}>
+            <div style={s.hintSwatch(0.05, 0.1, 0.85)} />
+            <span style={s.hintText}>Red = opposed audience</span>
+          </div>
+          <div style={s.hintRow}>
+            <div style={{ ...s.hintSwatch(0.4, 0.5, 0.1), opacity: 0.5 }} />
+            <span style={s.hintText}>Washed out = low confidence / noisy signal</span>
           </div>
         </div>
       </div>
 
       {/* Topic list */}
-      <div style={{ ...s.section, padding: '10px 0 0', borderBottom: 'none', flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <div style={{ ...s.sectionLabel, padding: '0 16px 8px' }}>
+      <div style={{
+        ...s.section,
+        padding: '10px 0 0',
+        borderBottom: 'none',
+        flex: 1,
+        display: 'flex',
+        flexDirection: 'column',
+        overflow: 'hidden',
+      }}>
+        <div style={{ ...s.sectionLabel, padding: '0 16px 6px' }}>
           {isDrilldown ? 'Attributes' : 'Topics by Volume'}
         </div>
         <div style={s.scrollList}>
@@ -168,7 +168,7 @@ export default function LegendPanel({ sortedData, activeIdx, onHoverTopic, isDri
               onMouseEnter={() => onHoverTopic?.(i)}
               onMouseLeave={() => onHoverTopic?.(null)}
             >
-              <div style={s.swatch(topicSwatch(topic.baseHue))} />
+              <span style={s.rankNum}>{i + 1}</span>
               <span style={s.topicName(activeIdx === i)}>{topic.name}</span>
               <span style={s.vol}>{topic.totalVolume.toLocaleString()}</span>
             </div>
